@@ -18,11 +18,12 @@ Recommends_plugins=htmlpurifier
 [END_COT_EXT]
 
 [BEGIN_COT_EXT_CONFIG]
-safemode=01:radio::0:Safe mode
-breaks=02:radio::0:Line breaks
-markupescaped=03:radio::0:Escape markup
-urlslinked=04:radio::1:Auto-link URLs
-anchorfix=05:radio::1:Anchor fix
+editor=01:hidden::parsedown:
+safemode=02:radio::0:Safe mode
+breaks=03:radio::0:Line breaks
+markupescaped=04:radio::0:Escape markup
+urlslinked=05:radio::1:Auto-link URLs
+anchorfix=06:radio::1:Anchor fix
 [END_COT_EXT_CONFIG]
 ==================== */
 
