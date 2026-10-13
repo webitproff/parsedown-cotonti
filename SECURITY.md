@@ -1,3 +1,1217 @@
+# Parsedown Markdown Plugin Security for Cotonti
+___
+**Website Security Guide for Using the Parsedown Markdown Plugin**
+___
+
+> **File:** `SECURITY.md`
+> 
+> **Repository:** https://github.com/webitproff/parsedown-cotonti
+> 
+> **Applies to version:** 1.0.1 and above
+> 
+> **Updated:** 2026-10-13
+> 
+___
+
+
+1. How content protection works in the **Parsedown + HTML Purifier** bundle.
+2. What changes were made to the **HTML Purifier plugin** and **why**.
+3. What changes were made to the **HTML Purifier presets** and **why**.
+4. Operating rules so that protection works.
+5. What to do if something doesn't work.
+
+---
+
+## Table of Contents
+
+- [1. Threat Model](#1-threat-model)
+- [2. Two-Layer Protection Architecture](#2-two-layer-protection-architecture)
+- [3. What Was Changed in the HTML Purifier Plugin](#3-what-was-changed-in-the-html-purifier-plugin)
+- [4. What Was Changed in the HTML Purifier Presets](#4-what-was-changed-in-the-html-purifier-presets)
+- [5. Step-by-Step Guide to Applying the Changes](#5-step-by-step-guide-to-applying-the-changes)
+- [6. Operating Rules](#6-operating-rules)
+- [7. Post-Installation Checklist](#7-post-installation-checklist)
+- [8. Diagnostics](#8-diagnostics)
+- [9. What to Do in Case of an Incident](#9-what-to-do-in-case-of-an-incident)
+- [10. Contacts and Feedback](#10-contacts-and-feedback)
+
+---
+
+## 1. Threat Model
+
+Parsedown by itself is a **parser**, not a sanitizer. If it is used without
+additional protection, an attacker can use content to:
+
+| Vector | What it does | Consequences |
+|---|---|---|
+| `<script>` | Executes JS in the reader's browser | Cookie/session theft, redirection, keylogger |
+| `onclick`, `onerror`, `onload` | Same as `<script>`, but via an attribute | Same |
+| `javascript:` in `href` | Executes JS when the link is clicked | Same |
+| `<iframe src="/admin.php">` | Transparent embedding of the admin panel | Actions on behalf of the victim (CSRF) |
+| `<style>body{display:none}</style>` | Breaks site layout | DoS for readers |
+| `<meta http-equiv="refresh">` | Automatic redirect | Leads to phishing |
+| `<base href="//evil.example">` | Overrides the base URL | All relative links point to a foreign domain |
+| `<form>`, `<input>` | Forging site forms | Phishing, CSRF |
+| `<svg><script>...` | XSS via SVG | Same as `<script>` |
+| `data:text/html;base64,...` | Executable HTML in a link | XSS |
+
+**The system's goal:** to reliably strip everything from this list, while
+not interfering with legitimate Markdown and safe HTML markup.
+
+---
+
+## 2. Two-Layer Protection Architecture
+
+The Parsedown plugin and the HTML Purifier plugin work **sequentially** in a
+single request:
+
+```
+User writes Markdown
+        │
+        ▼
+Save to DB  ──────────────────────────────────────────────┐
+   (raw Markdown + possible raw HTML)                     │
+        │                                                 │
+        ▼                                                 │
+Page output                                              │
+   cot_parse($text, true, 'parsedown')                    │
+        │                                                 │
+        ▼                                                 │
+Layer 1: Parsedown                                        │
+   • converts Markdown → HTML                             │
+   • safemode=1 escapes embedded HTML                     │
+   • safemode=0 passes HTML through as-is                 │
+        │                                                 │
+        ▼                                                 │
+Layer 2: HTML Purifier (cot_import_filters['HTM'])        │
+   • strips everything dangerous from the resulting HTML  │
+   • applies a whitelist of tags and attributes           │
+   • applies a blacklist                                  │
+   • applies a URI whitelist                              │
+        │                                                 │
+        ▼                                                 │
+Ready safe HTML → template                                │
+        │                                                 │
+        ▼                                                 │
+Reader's browser                                          │
+```
+
+**Key rule:** if one layer lets something through, the second will close
+the gap. Never rely on just one layer.
+
+---
+
+## 3. What Was Changed in the HTML Purifier Plugin
+
+### 3.1. File `plugins/htmlpurifier/htmlpurifier.php`
+
+**Problem:** originally, the function `htmlpurifier_filter()` only worked
+if the `html` parser was active:
+
+```php
+// Before (original):
+if (Cot::$sys['parser'] == 'html') {
+    // filtering ...
+} else {
+    return $value;   // ← with parsedown the filter silently did nothing
+}
+```
+
+When switching to `parsedown` as the active parser, the condition
+**never became true**, the filter didn't run, and raw HTML went into the DB.
+
+**Solution:** expand the condition so that the filter also works for
+`parsedown` (and any other parsers that might be needed):
+
+```php
+// After:
+if (in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)) {
+    // filtering ...
+} else {
+    return $value;
+}
+```
+
+**Where to change:** `plugins/htmlpurifier/htmlpurifier.php`, function
+`htmlpurifier_filter()`, the very first line of the function body.
+
+**What this gives:** HTML Purifier now fires even when the `parsedown`
+parser is active. This is mandatory for the whole chain to work properly.
+
+### 3.2. If You Add Your Own Parser
+
+If you ever need to hook up another parser (for example,
+`commonmark`), just add its name to the array:
+
+```php
+if (in_array(Cot::$sys['parser'], ['html', 'parsedown', 'commonmark'], true)) {
+```
+
+The order of elements doesn't matter — what matters is that it's present.
+
+### 3.3. Full Text of the `htmlpurifier_filter()` Function After the Change
+
+For reference — this is what the function should look like after applying
+the change. The beginning of the file (`defined('COT_CODE') or die()`, comments,
+library inclusion) is left unchanged; **only
+the `if` condition** is being modified.
+
+```php
+<?php
+/* ====================
+[BEGIN_COT_EXT]
+Hooks=global
+[END_COT_EXT]
+==================== */
+
+defined('COT_CODE') or die('Wrong URL');
+
+function htmlpurifier_filter($value, $name = '')
+{
+    if (in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)) {
+
+        static $purifier = null;
+
+        // Lazy loading to save performance
+        if (is_null($purifier)) {
+            define('HTMLPURIFIER_PREFIX', Cot::$cfg['plugins_dir'] . '/htmlpurifier/lib/standalone');
+            require_once Cot::$cfg['plugins_dir'] . '/htmlpurifier/lib/HTMLPurifier.standalone.php';
+
+            $cacheDir = Cot::$cfg['cache_dir'] . DIRECTORY_SEPARATOR . 'htmlpurifier';
+            if (!file_exists($cacheDir)) {
+                mkdir($cacheDir, 0775, true);
+            }
+            $cacheDir = realpath($cacheDir);
+
+            $config = HTMLPurifier_Config::createDefault();
+            $config->set('HTML.TidyLevel', Cot::$cfg['plugin']['htmlpurifier']['tidylevel']);
+
+            // protects theme IDs from duplication
+            if ('nemesis' == Cot::$usr['theme']) {
+                $config->set('Attr.IDBlacklist', [
+                    'main', 'footer', 'account', 'powered', 'magnifer',
+                    'search', 'header', 'nav', 'slider', 'front_image'
+                ]);
+            }
+
+            if (
+                isset(Cot::$cfg['plugin']['htmlpurifier']['videoiframe']) &&
+                Cot::$cfg['plugin']['htmlpurifier']['videoiframe'] &&
+                Cot::$usr['id'] > 0
+            ) {
+                $config->set('HTML.SafeIframe', true);
+                $config->set(
+                    'URI.SafeIframeRegexp',
+                    '%^(http:|https:)?//(www.youtube(?:-nocookie)?.com/embed/|player.vimeo.com/video/)%'
+                );
+            }
+
+            $config->set('URI.Base', COT_ABSOLUTE_URL);
+            $config->set('URI.Host', Cot::$sys['domain']);
+
+            if (Cot::$cfg['plugin']['htmlpurifier']['rel2abs']) {
+                $config->set('URI.MakeAbsolute', true);
+            }
+            $config->set('Cache.SerializerPath', $cacheDir);
+
+            // Load preset
+            if (Cot::$usr['id'] > 0) {
+                $preset_name = 'group_' . Cot::$usr['maingrp'];
+                if (!file_exists(
+                    Cot::$cfg['plugins_dir'] . '/htmlpurifier/presets/htmlpurifier.'
+                    . "$preset_name.preset.php"
+                )) {
+                    $preset_name = 'default';
+                }
+            } else {
+                $preset_name = 'group_1';
+            }
+            require_once Cot::$cfg['plugins_dir']
+                . "/htmlpurifier/presets/htmlpurifier.$preset_name.preset.php";
+
+            /* config extension */
+            foreach (cot_getextplugins('htmlpurifier.config') as $pl) {
+                include $pl;
+            }
+
+            foreach ($htmlpurifier_preset as $key => $val) {
+                $config->set($key, $val);
+            }
+
+            $doctype = Cot::$cfg['plugin']['htmlpurifier']['doctype'];
+
+            if ('HTML5' == $doctype) {
+                require_once cot_incfile('htmlpurifier', 'plug', 'html5');
+            } else {
+                $config->set('HTML.Doctype', $doctype);
+            }
+
+            $purifier = new HTMLPurifier($config);
+        }
+
+        return $purifier->purify($value);
+
+    } else {
+        return $value;
+    }
+}
+
+$cot_import_filters['HTM'][] = 'htmlpurifier_filter';
+```
+
+**What changed relative to the original:** only the line
+
+```php
+if (Cot::$sys['parser'] == 'html') {
+```
+
+has been replaced with
+
+```php
+if (in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)) {
+```
+
+Everything else is unchanged.
+
+### 3.4. How HTML Purifier Is Applied to Fields
+
+It's important to understand: **there is no list of fields in the HTML
+Purifier plugin settings.** The plugin registers itself with a single call:
+
+```php
+$cot_import_filters['HTM'][] = 'htmlpurifier_filter';
+```
+
+The `htmlpurifier_filter()` filter fires automatically **on every**
+call to `cot_import()` with the third parameter `'HTM'`. For example, in the
+`page` module:
+
+```php
+$rpage['page_text'] = cot_import('rpage_text', 'P', 'HTM');
+//                                              ^^^
+//                                   this is where HTML Purifier fires
+```
+
+This means: **if a field is imported with the `'HTM'` filter — it is
+filtered; if with `'TXT'` or another — it is not filtered.** There are no
+"field lists" in the HTML Purifier admin panel, and there never were.
+
+---
+
+## 4. What Was Changed in the HTML Purifier Presets
+
+Both presets (`default` and `group_5`) have been completely rewritten so
+that they reliably cut out the dangerous stuff **even with
+`HTML.Trusted = true`**. The original settings are preserved in Block 1 of
+each file; everything that was added is marked with separate blocks and
+commented.
+
+### 4.1. File `htmlpurifier.default.preset.php`
+
+Preset for everyone except admins. Applied by default if the user's group
+doesn't have its own `htmlpurifier.group_N.preset.php` file.
+
+| Block | What was added | Why |
+|---|---|---|
+| **2** | `HTML.Allowed` — a strict whitelist | Anything not on the list is cut out even with an erroneous `Trusted = true` |
+| **3** | `HTML.ForbiddenElements` — 17 tags | `script`, `style`, `link`, `meta`, `base`, `form`, `input`, `iframe`, `object`, `embed`, `svg`, `math`, `canvas`, etc. |
+| **4** | `HTML.ForbiddenAttributes` — `*@on*` and others | Kills `onclick`, `onerror`, `onload` and hundreds of other handlers |
+| **5** | `URI.AllowedSchemes` — scheme whitelist | Cuts off `javascript:`, `vbscript:`, `data:text/html`, `file:` |
+| **6** | `HTML.SafeIframe` + regexp | Allows `<iframe>` only from YouTube/Vimeo/VK |
+| **7** | `Attr.AllowedFrameTargets`, `Attr.EnabledID` | Trims `target` to `_blank`, forbids `id` for users |
+| **8** | `SafeObject`, `SafeEmbed`, `FlashCompat` disabled | Outdated embedding technologies are closed |
+
+**What was NOT affected:** basic Markdown formatting — `p`, `br`,
+`strong`, `em`, `del`, `ul`, `ol`, `li`, `blockquote`, `pre`, `code`,
+`h1–h6`, `table`, `thead`, `tbody`, `tr`, `th`, `td`, `hr`, `a`, `img`.
+
+**Full text of the file to place at
+`plugins/htmlpurifier/presets/htmlpurifier.default.preset.php`:**
+
+```php
+<?php
+/**
+ * ============================================================================
+ * HTML Purifier — default preset (fallback)
+ * ============================================================================
+ *
+ * File:    plugins/htmlpurifier/presets/htmlpurifier.default.preset.php
+ * Type:    fallback preset for all groups without their own file
+ *          htmlpurifier.group_N.preset.php
+ *
+ * Task:    pass safe HTML (bold, italic, lists, tables,
+ *          links, images) and at the same time reliably cut out everything
+ *          that can be used to attack the site or the reader — taking into
+ *          account that the content is parsed by Parsedown (Markdown → HTML).
+ *
+ * IMPORTANT: the preset is automatically applied to all fields that
+ * are imported into Cotonti with the 'HTM' filter (see cot_import calls
+ * in the page, comments, forums modules, etc.).
+ *
+ * @package    HTML Purifier
+ * @subpackage Presets
+ * @author     Cotonti Team
+ * @copyright  (c) Cotonti Team
+ * @license    https://github.com/Cotonti/Cotonti/blob/master/License.txt
+ * @link       http://htmlpurifier.org/live/configdoc/plain.html
+ * ============================================================================
+ */
+
+defined('COT_CODE') or die('Wrong URL');
+
+$htmlpurifier_preset = [
+
+    /* ========================================================================
+     * BLOCK 1. ORIGINAL SETTINGS — LEFT AS-IS
+     * ====================================================================== */
+
+    // Autoformatting
+    'AutoFormat.AutoParagraph'                => false,
+    'AutoFormat.DisplayLinkURI'               => false,
+    'AutoFormat.Linkify'                      => false,
+    'AutoFormat.RemoveEmpty.RemoveNbsp'       => false,
+    'AutoFormat.RemoveEmpty'                  => true,
+    'AutoFormat.RemoveSpansWithoutAttributes' => true,
+
+    // Custom filters
+    'Filter.Custom'                           => [],
+
+    // HTML and output.
+    // null is overridden below by Block 2.
+    'HTML.Allowed'                            => null,
+
+    'HTML.FlashAllowFullScreen'               => false,
+    'HTML.SafeObject'                         => true,
+
+    // Trust mode — for user content only false
+    'HTML.Trusted'                            => false,
+
+    'Output.FlashCompat'                      => true,
+
+    // URI
+    'URI.DisableExternal'                     => false,
+    'URI.DisableExternalResources'            => false,
+
+
+    /* ========================================================================
+     * BLOCK 2. EXPLICIT TAG WHITELIST
+     * ====================================================================== */
+    'HTML.Allowed'                            =>
+          'p[align|style|class],br,'
+        . 'div[align|class|style|id],'
+        . 'span[class|style],'
+        . 'strong,b,em,i,u,s,strike,del,ins,sup,sub,small,big,'
+        . 'a[href|title|rel|target|class],'
+        . 'img[src|alt|title|width|height|class|style],'
+        . 'ul[class|style],ol[class|style],li[class|style],'
+        . 'blockquote[class|style|cite],'
+        . 'pre[class|style],code[class|style],'
+        . 'h1[class|style|id],h2[class|style|id],h3[class|style|id],'
+        . 'h4[class|style|id],h5[class|style|id],h6[class|style|id],'
+        . 'table[class|style|border|cellpadding|cellspacing],'
+        . 'thead[class],tbody[class],tfoot[class],'
+        . 'tr[class|style],'
+        . 'th[class|style|colspan|rowspan],'
+        . 'td[class|style|colspan|rowspan],'
+        . 'hr[class|style],'
+        . 'kbd,mark,abbr[title],cite,figure,figcaption,details,summary',
+
+
+    /* ========================================================================
+     * BLOCK 3. TAG BLACKLIST
+     * ====================================================================== */
+    'HTML.ForbiddenElements'                  => [
+        'script',
+        'style',
+        'link',
+        'meta',
+        'base',
+        'form',
+        'input',
+        'textarea',
+        'select',
+        'option',
+        'button',
+        'iframe',
+        'object',
+        'embed',
+        'applet',
+        'canvas',
+        'svg',
+        'math',
+    ],
+
+
+    /* ========================================================================
+     * BLOCK 4. ATTRIBUTE BLACKLIST
+     * ====================================================================== */
+    'HTML.ForbiddenAttributes'                => [
+        '*@on*',
+        '*@formaction',
+        '*@xmlns',
+        '*@srcdoc',
+        'a@ping',
+        'a@download',
+    ],
+
+
+    /* ========================================================================
+     * BLOCK 5. LINK SCHEME WHITELIST
+     * ====================================================================== */
+    'URI.AllowedSchemes'                      => [
+        'http'   => true,
+        'https'  => true,
+        'mailto' => true,
+        'tel'    => true,
+    ],
+
+
+    /* ========================================================================
+     * BLOCK 6. IFRAME WHITELIST
+     * ====================================================================== */
+    'HTML.SafeIframe'                         => true,
+    'URI.SafeIframeRegexp'                    => '%^(https?:)?//('
+        . 'www\.youtube(?:-nocookie)?\.com/embed/|'
+        . 'player\.vimeo\.com/video/|'
+        . 'vk\.com/video_ext\.php'
+        . ')%i',
+
+
+    /* ========================================================================
+     * BLOCK 7. ATTRIBUTE CONTROL
+     * ====================================================================== */
+    'Attr.AllowedFrameTargets'                => ['_blank'],
+    'Attr.AllowedRel'                         => ['nofollow', 'noreferrer', 'noopener'],
+    'Attr.EnableID'                           => false,
+    'Attr.AllowedClasses'                     => null,
+
+
+    /* ========================================================================
+     * BLOCK 8. FLASH / OBJECT / EMBED — DISABLED
+     * ====================================================================== */
+    'HTML.FlashAllowFullScreen'               => false,
+    'HTML.SafeObject'                         => false,
+    'HTML.SafeEmbed'                          => false,
+    'Output.FlashCompat'                      => false,
+    'HTML.Nofollow'                           => false,
+    'Filter.YouTube'                          => false,
+];
+```
+
+### 4.2. File `htmlpurifier.group_5.preset.php`
+
+Preset for superadmins (group 5). Gives freedom of markup, but closes
+dangerous things manually, because `HTML.Trusted = true` disables most of
+Purifier's built-in checks.
+
+| Block | What was added | Why |
+|---|---|---|
+| **2** | `HTML.ForbiddenElements` — expanded from `['script']` to the full list | With `Trusted = true`, only this list catches `<iframe>`, `<style>`, `<form>`, `<svg>` and the like |
+| **3** | `HTML.ForbiddenAttributes` — `*@on*`, `*@srcdoc`, `a@ping`, `a@download` | With `Trusted = true`, without this list `onclick` passes through |
+| **4** | `URI.AllowedSchemes` | With `Trusted = true`, Purifier doesn't check schemes — an explicit whitelist is needed |
+| **5** | `HTML.SafeIframe` + regexp | `<iframe src="//evil.example">` is cut; YouTube/Vimeo/VK — pass |
+| **6** | `SafeObject`, `SafeEmbed`, `FlashCompat` disabled | They weaken protection when `Trusted = true` |
+
+**What is preserved for the admin:**
+- `<p align="center">`, `<div class="...">`, `<span style="...">` — inserts.
+- `<kbd>`, `<mark>`, `<abbr>`, `<details>`, `<summary>` — custom tags.
+- `<iframe>` from YouTube/Vimeo/VK — video embedding.
+- `id` on elements — anchor links `#section`.
+- `class` — any classes (Bootstrap, theme, etc.).
+
+**What is cut even for the admin:** `<script>`, `onclick`, `javascript:`,
+`<iframe src="/admin.php">`, `<style>`, `<form>`, `<object>`, `<svg>`.
+
+**Full text of the file to place at
+`plugins/htmlpurifier/presets/htmlpurifier.group_5.preset.php`:**
+
+```php
+<?php
+/**
+ * ============================================================================
+ * HTML Purifier — preset for superadmins (MainGroupId = 5)
+ * ============================================================================
+ *
+ * File:    plugins/htmlpurifier/presets/htmlpurifier.group_5.preset.php
+ * Task:    give the administrator freedom of markup (inserts, centering,
+ *          classes, id, embedded videos), but close the really dangerous
+ *          constructs: XSS, auto-redirects, markup and form substitution.
+ *
+ * IMPORTANT: the preset is automatically applied to all fields that
+ * are imported into Cotonti with the 'HTM' filter (see cot_import calls
+ * in the page, comments, forums modules, etc.).
+ *
+ * @package    HTML Purifier
+ * @subpackage Presets
+ * @author     Cotonti Team
+ * @copyright  (c) Cotonti Team
+ * @license    https://github.com/Cotonti/Cotonti/blob/master/License.txt
+ * @link       http://htmlpurifier.org/live/configdoc/plain.html
+ * ============================================================================
+ */
+
+defined('COT_CODE') or die('Wrong URL');
+
+require_once Cot::$cfg['plugins_dir']
+    . '/htmlpurifier/lib/standalone/HTMLPurifier/Filter/YouTube.php';
+
+$htmlpurifier_preset = [
+
+    /* ========================================================================
+     * BLOCK 1. ORIGINAL SETTINGS
+     * ====================================================================== */
+
+    'AutoFormat.AutoParagraph'                => false,
+    'AutoFormat.DisplayLinkURI'               => false,
+    'AutoFormat.Linkify'                      => false,
+    'AutoFormat.RemoveEmpty.RemoveNbsp'       => false,
+    'AutoFormat.RemoveEmpty'                  => true,
+    'AutoFormat.RemoveSpansWithoutAttributes' => true,
+
+    'Filter.Custom'                           => [],
+
+    'HTML.Allowed'                            => null,
+
+    'HTML.FlashAllowFullScreen'               => true,
+    'HTML.Nofollow'                           => true,
+    'HTML.SafeObject'                         => true,
+    'HTML.SafeEmbed'                          => true,
+
+    'HTML.Trusted'                            => true,
+
+    'HTML.ForbiddenElements'                  => ['script'],
+
+    'Output.FlashCompat'                      => true,
+    'Filter.YouTube'                          => true,
+
+    'URI.DisableExternal'                     => false,
+    'URI.DisableExternalResources'            => false,
+
+    'Attr.AllowedFrameTargets'                => ['_blank', '_self', '_parent', '_top'],
+    'Attr.EnableID'                           => true,
+
+
+    /* ========================================================================
+     * BLOCK 2. TAG BLACKLIST — OVERRIDES THE ORIGINAL
+     * ====================================================================== */
+    'HTML.ForbiddenElements'                  => [
+        'script',
+        'style',
+        'link',
+        'meta',
+        'base',
+        'form',
+        'input',
+        'textarea',
+        'select',
+        'option',
+        'button',
+        'object',
+        'embed',
+        'applet',
+        'canvas',
+        'svg',
+        'math',
+    ],
+
+
+    /* ========================================================================
+     * BLOCK 3. ATTRIBUTE BLACKLIST
+     * ====================================================================== */
+    'HTML.ForbiddenAttributes'                => [
+        '*@on*',
+        '*@formaction',
+        '*@xmlns',
+        '*@srcdoc',
+        'a@ping',
+        'a@download',
+    ],
+
+
+    /* ========================================================================
+     * BLOCK 4. LINK SCHEME WHITELIST
+     * ====================================================================== */
+    'URI.AllowedSchemes'                      => [
+        'http'   => true,
+        'https'  => true,
+        'mailto' => true,
+        'tel'    => true,
+    ],
+
+
+    /* ========================================================================
+     * BLOCK 5. IFRAME WHITELIST
+     * ====================================================================== */
+    'HTML.SafeIframe'                         => true,
+    'URI.SafeIframeRegexp'                    => '%^(https?:)?//('
+        . 'www\.youtube(?:-nocookie)?\.com/embed/|'
+        . 'player\.vimeo\.com/video/|'
+        . 'vk\.com/video_ext\.php'
+        . ')%i',
+
+
+    /* ========================================================================
+     * BLOCK 6. FLASH / OBJECT / EMBED — DISABLED
+     * ====================================================================== */
+    'HTML.FlashAllowFullScreen'               => false,
+    'HTML.SafeObject'                         => false,
+    'HTML.SafeEmbed'                          => false,
+    'Output.FlashCompat'                      => false,
+    'HTML.Nofollow'                           => false,
+    'Filter.YouTube'                          => false,
+
+
+    /* ========================================================================
+     * BLOCK 7. ATTRIBUTES
+     * ====================================================================== */
+    'Attr.AllowedFrameTargets'                => ['_blank'],
+    'Attr.AllowedRel'                         => ['nofollow', 'noreferrer', 'noopener'],
+    'Attr.EnableID'                           => true,
+    'Attr.AllowedClasses'                     => null,
+];
+```
+
+### 4.3. Why `HTML.Trusted = true` Was Kept in the Admin Preset
+
+Technically, `Trusted = true` removes almost all of HTML Purifier's internal
+filters. This is a compromise: it's needed so the admin can lay out inserts
+and use custom tags without rewriting the whitelist for each
+case.
+
+With `Trusted = true`, protection rests solely on:
+- `HTML.ForbiddenElements` (Block 2)
+- `HTML.ForbiddenAttributes` (Block 3)
+- `URI.AllowedSchemes` (Block 4)
+- `URI.SafeIframeRegexp` (Block 5)
+
+If at least one of these blocks is removed, the admin preset becomes
+vulnerable. **Do not remove these blocks without understanding the
+consequences.**
+
+---
+
+## 5. Step-by-Step Guide to Applying the Changes
+
+Below is the exact sequence of actions. Follow it in order.
+Do not skip steps.
+
+### Step 1. Backup
+
+**What to do:**
+
+1. Download from the server and save three files locally:
+   - `plugins/htmlpurifier/htmlpurifier.php`
+   - `plugins/htmlpurifier/presets/htmlpurifier.default.preset.php`
+   - `plugins/htmlpurifier/presets/htmlpurifier.group_5.preset.php`
+
+**Why:** if something goes wrong, you can revert to how it was.
+
+### Step 2. Edit `htmlpurifier.php`
+
+**File:** `plugins/htmlpurifier/htmlpurifier.php`
+
+**What to do:**
+
+1. Open the file in an editor.
+2. Find the `htmlpurifier_filter()` function.
+3. In its body, find the **very first condition line**:
+
+   ```php
+   if (Cot::$sys['parser'] == 'html') {
+   ```
+
+4. Replace it with:
+
+   ```php
+   if (in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)) {
+   ```
+
+5. Save the file.
+
+**Check:** search the file for the line
+
+```
+in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)
+```
+
+If it's found — the change is applied.
+
+**What NOT to change in this file:** everything else in the body of the
+`htmlpurifier_filter()` function, the library inclusion, `$cot_import_filters['HTM'][]`.
+
+### Step 3. Check `htmlpurifier.config.php`
+
+**File:** `plugins/htmlpurifier/htmlpurifier.config.php`
+
+**What to do:**
+
+1. Check whether such a file exists in the plugin folder.
+2. If it **exists** — open it and look for the lines:
+
+   ```php
+   'HTML.Trusted'   => true,
+   'HTML.Allowed'   => null,
+   ```
+
+3. If these lines exist, then **the file must be deleted** (or renamed to
+   `htmlpurifier.config.php.bak`). Otherwise it will overwrite both presets, and
+   the changes from Steps 4–5 won't take effect.
+4. If the file doesn't exist — move on to Step 4.
+
+**Why:** `htmlpurifier.config.php` is included by the
+`htmlpurifier.config` hook **after** the preset is loaded and **overwrites**
+any of its settings. As long as it exists, it controls protection, not your preset.
+
+### Step 4. Replace `htmlpurifier.default.preset.php`
+
+**File:** `plugins/htmlpurifier/presets/htmlpurifier.default.preset.php`
+
+**What to do:**
+
+1. Open the file.
+2. Delete **all** of its contents.
+3. Paste the full text from section [4.1](#41-file-htmlpurifierdefaultpresetphp)
+   of this document — from `<?php` to the last closing `];`.
+4. Save the file.
+
+**Check:** the file should contain the blocks:
+
+- `'HTML.Trusted' => false`
+- `'HTML.Allowed' => 'p[align|style|class], ...'` (not `null`)
+- `'HTML.ForbiddenElements' => [...]`
+- `'HTML.ForbiddenAttributes' => [...]`
+- `'URI.AllowedSchemes' => [...]`
+
+### Step 5. Replace `htmlpurifier.group_5.preset.php`
+
+**File:** `plugins/htmlpurifier/presets/htmlpurifier.group_5.preset.php`
+
+**What to do:**
+
+1. Open the file.
+2. Delete **all** of its contents.
+3. Paste the full text from section [4.2](#42-file-htmlpurifiergroup_5presetphp)
+   of this document — from `<?php` to the last closing `];`.
+4. Save the file.
+
+**Check:** the file should contain the blocks:
+
+- `'HTML.Trusted' => true`
+- `'HTML.ForbiddenElements' => ['script', 'style', ...]` (expanded, not just `script`)
+- `'HTML.ForbiddenAttributes' => ['*@on*', ...]`
+- `'URI.AllowedSchemes' => [...]`
+- `'URI.SafeIframeRegexp' => ...`
+
+### Step 6. Install/Reinstall the HTML Purifier Plugin
+
+**What to do:**
+
+1. Open the **Admin Panel** → **Extensions**.
+2. Find **HTML Purifier**.
+3. Click **Uninstall**.
+4. Click **Install**.
+
+**Why:** on uninstall/install, Cotonti rebuilds the
+`$cot_plugins` registry and picks up the fresh change in `htmlpurifier.php`.
+
+**Caution:** do not confuse HTML Purifier with Parsedown Markdown. These are
+two different plugins, and each is installed separately.
+
+### Step 7. How HTML Purifier Is Applied to Fields
+
+Filtering is enabled via the **`'HTM'` parameter** in `cot_import()`
+calls inside Cotonti modules.
+
+**What to do to double-check:**
+
+1. Open the module file where content is saved:
+   - `modules/page/page.edit.php` — for pages (here just as an example)
+
+2. Find the import line for the desired field. For example, for page text:
+
+   ```php
+   $rpage['page_text'] = cot_import('rpage_text', 'P', 'HTM');
+   ```
+
+3. Make sure the third parameter is `'HTM'`. If it's `'TXT'` or
+   something else — HTML Purifier is **not applied** to this field, and
+   the changes in `htmlpurifier.php` and the presets won't change anything.
+
+**If you need another field to be filtered** — change the filter in
+the corresponding module:
+
+```php
+// Before:
+$rdata['some_field'] = cot_import('some_field', 'P', 'TXT');
+
+// After:
+$rdata['some_field'] = cot_import('some_field', 'P', 'HTM');
+```
+
+**Check:** open the module file, search for the name of the desired
+field and make sure `'HTM'` is next to it.
+
+### Step 8. Clear the Cotonti Cache
+
+**What to do:**
+
+1. Open the **Admin Panel** → **Home**.
+2. Click **Clear cache**.
+
+**Why:** presets and plugin settings are cached. Without clearing the cache,
+the changes may not take effect.
+
+### Step 9. Check the Parser
+
+**What to do:**
+
+1. Open the **Admin Panel** → **Configuration** → **Parser**.
+2. Make sure **`parsedown`** is selected.
+3. Make sure other parsers are **not** selected at the same time
+   (`html`, `markitup`, `ckeditor`, etc.).
+4. Save.
+
+### Step 10. Enable Safe Mode in Parsedown (for a Public Site)
+
+**What to do:**
+
+1. Open the **Admin Panel** → **Plugins** → **Parsedown Markdown**.
+2. Enable the **Safe mode** option (`safemode = 1`).
+3. If necessary, enable **Escape markup** (`markupescaped = 1`).
+4. Save.
+
+**Why:** Safe mode is the first independent layer of protection. HTML Purifier is
+the second. Enabling both is the right thing to do.
+
+### Step 11. Testing
+
+**What to do:**
+
+1. Open the site as a **regular user** (not an admin).
+2. Create a page or comment with the following content:
+
+   ```html
+   <script>alert(1)</script>
+   <div onclick="alert(2)">click</div>
+   <iframe src="//evil.example"></iframe>
+   <style>body{display:none}</style>
+   <a href="javascript:alert(3)">link</a>
+   <img src="x" onerror="alert(4)">
+   ```
+
+3. Save.
+4. Open the saved page in a browser.
+5. Press **Ctrl+U** (HTML source) and look for dangerous constructs.
+6. Open the browser console (**F12**).
+
+**Expected result:**
+
+- Not a single `alert()` popped up.
+- The HTML source contains no `<script>`, `<iframe>`, `onclick`, `onerror`,
+  `javascript:`, `<style>`.
+- Legitimate tags (`<p>`, `<strong>`, `<ul>`, `<a href="https://...">`)
+  remain in place.
+
+### Step 12. If the Check Failed
+
+See section [8. Diagnostics](#8-diagnostics). It describes
+in what order to check steps 1–10 and what to pay attention to.
+
+### Step 13. Updating Old Records (Optional)
+
+If the DB contains old records with embedded HTML (made **before**
+protection was installed), they are no longer dangerous on output — HTML Purifier will clean them on
+render. But if you want to clean the records themselves in the DB, there are two ways:
+
+**Way A — manually.** Open each suspicious record in the editor and
+re-save it — then filtering will happen on save (if you
+have a save hook configured).
+
+**Way B — SQL.** Find suspicious records:
+
+```sql
+SELECT page_id, page_title
+FROM cot_pages
+WHERE page_text LIKE '%<script%'
+   OR page_text LIKE '%<iframe%'
+   OR page_text LIKE '%onerror%'
+   OR page_text LIKE '%onclick%';
+```
+
+Rewrite each one manually through the admin panel.
+
+> Automatic cleaning of old records is **not part of** this plugin.
+> It is done with a separate `page.edit.update` hook or script.
+
+---
+
+## 6. Operating Rules
+
+### 6.1. Mandatory
+
+1. **The HTML Purifier plugin must be installed and active.**
+   Without it, Parsedown is not a sanitizer by itself, and any XSS will pass.
+
+2. **`htmlpurifier.php` must have the change from section 3.1.**
+   Check the line:
+   ```php
+   if (in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)) {
+   ```
+   If it says `if (Cot::$sys['parser'] == 'html')`, the filter won't fire.
+
+3. **Content fields must be imported with the `'HTM'` filter.**
+   Check in the modules (`page.admin.php`, `comments.php`, `forums.post.php`)
+   that the `cot_import()` calls for the desired fields use the third parameter
+   `'HTM'`. Otherwise HTML Purifier is not applied to those fields.
+
+4. **The presets (`default` and `group_5`) must be filled in completely.**
+   Do not delete blocks 2–8 — they are the protection.
+
+5. **Only one content parser is selected.**
+   Using `parsedown` + `markitup` + `ckeditor` simultaneously
+   in the active parser gives unpredictable behavior.
+
+### 6.2. Recommended
+
+1. **Keep `safemode = 1` in Parsedown settings** for any
+   user content (comments, forum, guest pages).
+   This is the first independent layer of protection.
+
+2. **Limit access to HTML editing** — only to trusted
+   groups. In Cotonti settings this is done via group permissions.
+
+3. **Regularly update Cotonti and both plugins.**
+
+4. **Set up logging of filtering errors.** If HTML Purifier
+   cut something from legitimate content — that's a signal to revise
+   the whitelist, not to disable protection.
+
+5. **Periodically check content in the DB.** For example, an SQL query:
+   ```sql
+   SELECT page_id, page_title
+   FROM cot_pages
+   WHERE page_text REGEXP '<script|<iframe|on[a-z]+=|javascript:';
+   ```
+   If such records exist — they will appear from old versions of content
+   before protection was installed. They need to be re-saved manually.
+
+### 6.3. Forbidden
+
+1. **Setting `HTML.Trusted = true` in the `default` preset.**
+   This opens a hole for all users at once.
+
+2. **Setting `HTML.Allowed = null` in the `default` preset.**
+   By default, Purifier uses a fairly broad policy —
+   an explicit whitelist is better.
+
+3. **Disabling `HTML.ForbiddenAttributes`.**
+   Without `*@on*` in this list, `onclick="fetch('/admin.php')"`
+   will pass for anyone who can write content.
+
+4. **Allowing `<script>` and `<style>` in `HTML.Allowed`.**
+   Even temporarily, even "for testing".
+
+5. **Allowing `javascript:` and `data:text/html` in `URI.AllowedSchemes`.**
+   The first is XSS, the second is XSS via a link.
+
+6. **Using `HTML.SafeObject` and `HTML.SafeEmbed` with
+   `HTML.Trusted = true`.** Weakening them is pointless if `Trusted`
+   is enabled nearby.
+
+### 6.4. About Disabling Protection for the Admin
+
+If for some reason you need to give a specific user
+**complete** freedom of HTML without filtering (for example, a technical page
+with interactive JS) — do not do this via a preset. Instead:
+
+- Create a separate template where content is output via
+  `{PAGE_TEXT}` **without** `cot_parse()` (raw HTML from the field).
+- Restrict access to this page to your group only.
+- Never output user content this way.
+
+---
+
+## 7. Post-Installation Checklist
+
+Check item by item. If something is wrong — the filter is not working.
+
+- [ ] The **HTML Purifier** plugin is installed and active.
+- [ ] `htmlpurifier.php` contains `in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)`.
+- [ ] The file `htmlpurifier.config.php` is absent (or does not overwrite `Trusted`).
+- [ ] The file `htmlpurifier.default.preset.php` contains `'HTML.Trusted' => false` and an explicit `HTML.Allowed`.
+- [ ] The file `htmlpurifier.default.preset.php` contains blocks 2–8.
+- [ ] The file `htmlpurifier.group_5.preset.php` contains the expanded `HTML.ForbiddenElements`.
+- [ ] The file `htmlpurifier.group_5.preset.php` contains `HTML.ForbiddenAttributes` with `*@on*`.
+- [ ] Content fields in the modules (`page.admin.php`, `comments.php`, `forums.post.php`) are imported via `cot_import(..., 'HTM')`.
+- [ ] In **Configuration → Parser**, `parsedown` is selected.
+- [ ] In Parsedown settings, **Safe mode** is enabled (for a public site).
+- [ ] The Cotonti cache is cleared (Admin Panel → Home → Clear cache).
+- [ ] The HTML Purifier plugin has been reinstalled after the changes
+      (uninstall → install).
+
+### Test Check
+
+Create a page with the following content (as a **regular user**, not an admin):
+
+```html
+<script>alert(1)</script>
+<div onclick="alert(2)">click</div>
+<iframe src="//evil.example"></iframe>
+<style>body{display:none}</style>
+<a href="javascript:alert(3)">link</a>
+<img src="x" onerror="alert(4)">
+```
+
+Save. Open the page in a browser. Open the console.
+
+**Expected result:**
+- no `alert()` pops up;
+- the HTML source contains no `<script>`, `<iframe>`, `onclick`, `onerror`,
+  `javascript:`, `<style>`;
+- dangerous tags are either replaced or removed.
+
+**If something passed through** — see section 8.
+
+---
+
+## 8. Diagnostics
+
+### 8.1. Problem: Dangerous Code Gets into the DB
+
+**This is normal when filtering on output.** HTML Purifier in Cotonti
+fires when fields are imported via `cot_import(..., 'HTM')`, as well as
+via the `parser.last` hook at page render time. Raw `<script>` may
+reside in `page_text` — it will be cut on output.
+
+Check not the DB, but the **HTML source of the finished page**: Ctrl+U in
+the browser.
+
+**If you want to filter on save** — you need a separate
+`page.edit.update` hook that runs `page_text` through Purifier before
+writing to the DB. This is a separate task not included in the current plugin.
+
+### 8.2. Problem: Dangerous Code Gets into the Page HTML
+
+This means the filter is not applied to the field. Check:
+
+1. **Is the field imported with the `'HTM'` filter?**
+   Open the module, find `cot_import()` for the desired field, make sure
+   the third parameter is `'HTM'`. If it's `'TXT'` — the filter doesn't work.
+
+2. **Has the change in `htmlpurifier.php` been made?**
+   See section 3.1.
+
+3. **Is the cache cleared?**
+   Admin Panel → Home → Clear cache.
+
+4. **Has the plugin been reinstalled?**
+   After editing `htmlpurifier.php`, the plugin must be reinstalled for
+   the changes to be picked up.
+
+5. **Is `htmlpurifier.config.php` overwriting the settings?**
+   See Step 3 in section 5. If the file exists and contains
+   `'HTML.Trusted' => true`, it must be deleted.
+
+### 8.3. Problem: Legitimate Content Is Being Cut
+
+For example, a link to an image from an external domain doesn't work, or
+an insert `<div class="alert">` disappears.
+
+The cause is an overly strict whitelist. This is solved by **pointwise**
+expansion of the corresponding block, not by disabling protection
+entirely.
+
+| Symptom | Where to fix |
+|---|---|
+| Insert `<div class="...">` disappeared | `HTML.Allowed` — make sure `div[class]` is present |
+| Image from an external CDN doesn't work | `URI.DisableExternalResources => false` in the preset |
+| `<kbd>` or `<mark>` disappeared | Add to `HTML.Allowed` |
+| `target="_blank"` doesn't work | `Attr.AllowedFrameTargets` |
+| Anchor links don't work for a user | `Attr.EnableID => true` (careful, breaks layout) |
+| YouTube video doesn't save for the admin | Check `URI.SafeIframeRegexp` and that the domain is in the list |
+
+### 8.4. Problem: Error `Call to undefined function htmlpurifier_filter()`
+
+The HTML Purifier plugin is not connected. Admin Panel → Extensions → install.
+
+### 8.5. Problem: Error `Class 'HTMLPurifier' not found`
+
+The HTML Purifier library is damaged or missing. Reinstall
+the HTML Purifier plugin.
+
+### 8.6. Quick Check: Logging
+
+A temporary change to `htmlpurifier.php` for debugging. Insert at the
+beginning of the `htmlpurifier_filter()` function:
+
+```php
+if (!empty($value)) {
+    file_put_contents(
+        Cot::$cfg['cache_dir'] . '/purifier.log',
+        date('c') . " parser=" . Cot::$sys['parser']
+            . " in=" . strlen($value)
+            . " out=" . strlen(htmlspecialchars($value))
+            . "\n",
+        FILE_APPEND
+    );
+}
+```
+
+Open a page with dangerous content. Look at
+`datas/cache/purifier.log`:
+
+- **File appeared** → the filter is being called, the problem is in the preset itself.
+- **File didn't appear** → the filter is not being called at all. Check the change in
+  `htmlpurifier.php` and that the field is imported with `'HTM'`.
+
+**Don't forget to remove the change after debugging.**
+
+---
+
+## 9. What to Do in Case of an Incident
+
+If you suspect that XSS has already been used:
+
+1. **Change all passwords** — admin and user.
+2. **Check the DB for injected `<script>`**:
+   ```sql
+   SELECT page_id, page_title, page_text
+   FROM cot_pages
+   WHERE page_text LIKE '%<script%'
+      OR page_text LIKE '%<iframe%'
+      OR page_text LIKE '%onerror%'
+      OR page_text LIKE '%onclick%';
+   ```
+3. **Rewrite suspicious records** by running them through the current
+   HTML Purifier manually.
+4. **Check the Cotonti logs** — Admin Panel → Logs, as well as `system/log/`.
+5. **Check that the presets haven't been edited.** Compare with the reference
+   versions from section 4 of this document.
+6. **Update Cotonti, plugins, PHP** to the latest stable versions.
+7. **Enable `safemode = 1`** in Parsedown settings, if not already
+   enabled.
+
+---
+
+## 10. Contacts and Feedback
+
+Found a vulnerability or a bypass of the protection — report it via
+[Issues](https://github.com/webitproff/parsedown-cotonti/issues) or
+privately in the author's profile.
+
+When reporting, include:
+- plugin version;
+- Cotonti version;
+- PHP version;
+- reproduction steps;
+- a minimal content example.
+
+Please **do not publish the vulnerability publicly** until a patch is released.
+
+
+===
+РУССКИЙ
+===
 
 # Безопасность плагина Parsedown Markdown для Cotonti
 ___
