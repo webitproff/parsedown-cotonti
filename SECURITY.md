@@ -1209,9 +1209,9 @@ When reporting, include:
 Please **do not publish the vulnerability publicly** until a patch is released.
 
 
-===
-РУССКИЙ
-===
+---
+RU РУССКИЙ
+---
 
 # Безопасность плагина Parsedown Markdown для Cotonti
 ___
