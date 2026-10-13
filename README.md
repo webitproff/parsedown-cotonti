@@ -9,6 +9,9 @@
 
 A free **Markdown** parser plugin for the [Cotonti](https://www.cotonti.com/) CMS, built on top of the **[Parsedown 1.8.0](https://github.com/erusev/parsedown/releases/tag/1.8.0)** library.
 
+<img width="1280" height="720" alt="Markdown parser (Parsedown 1 8 0) for Cotonti" src="https://github.com/user-attachments/assets/1139270d-3ec4-4a39-80de-dafd74381e27" />
+
+
 The plugin registers itself in Cotonti as an `editor-parser`, installs easily through the admin panel, **does not require Composer**, and is compatible with modern PHP versions up to 8.5.
 
 - **Repository:** https://github.com/webitproff/parsedown-cotonti
