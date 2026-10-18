@@ -25,7 +25,11 @@ defined('COT_CODE') or die('Wrong URL');
 function htmlpurifier_filter($value, $name = '')
 {
 	if (in_array(Cot::$sys['parser'], ['html', 'parsedown'], true)) {
-
+        // Суперадмин (MainGroupId = 5) — не пропускаем через Purifier,
+        // чтобы не вырезались var(), {PHP|...} и другие конструкции
+        if ((int) Cot::$usr['maingrp'] === 5) {
+            return $value;
+        }
         static $purifier = null;
 
         // Lazy loading to save performance
